@@ -2,8 +2,8 @@
 
 A Blender addon for transferring Booth-style clothing armatures and meshes onto a base avatar armature. Handles pose matching, bone merging, mesh re-parenting, and shape-key-safe mesh baking in one workflow.
 
-**Version:** 1.0.0  
-**Blender:** 3.0+  
+**Version:** 1.0.5  
+**Blender:** 3.2+  
 **Location:** `View3D > Sidebar > Cloth Transfer`  
 **Category:** Rigging
 
@@ -140,6 +140,7 @@ Writes a detailed diagnostic report to:
 
 Report includes:
 - Plugin version and Blender version
+- The `.blend` file name and full path (so multiple dumps are easy to tell apart)
 - Both armatures: name, type, location, rotation, scale, pose position, bone count, constraints
 - Bone comparison: shared / only-cloth / only-base counts and full name lists
 - World-space positions of all shared bones (base vs cloth, with delta distance)
@@ -147,13 +148,67 @@ Report includes:
 - Per-bone residual after applying the estimated alignment
 - Full pairwise distance ratio statistics (min / P25 / median / P75 / max / mean)
 
+#### Full bone detail *(per armature)*
+
+A complete, read-only, per-bone table in armature/rest space — the data an
+external auto-IK / humanoid solver keys on. For **every** bone (no truncation):
+
+- Index in `data.bones` (export order), parent (name + index)
+- `use_deform`, `use_connect`, `use_inherit_rotation`, child count, descendant count
+- `head_local` / `tail_local` / length, plus **world-space** head & tail
+- Local **X / Y / Z axes** (Y is the head→tail direction; X/Z encode bone roll)
+- Bone-collection (4.0+) or layer (3.x) membership
+- A `parent -> [children in data order]` listing, flagging parents with multiple children
+- A note if the object's transform has non-identity / non-uniform scale
+
+This section works on a **single armature** too: if no Base/Clothing is set it
+falls back to the active object, then to every armature in the scene — so you can
+run it on a finished model (after the clothing rig was deleted) and on a
+known-good model, then diff the two text files.
+
+#### A/B bone diff *(when both armatures are set)*
+
+Load a **known-good model as Base** and a **suspect model as Clothing** in the
+same scene, then dump. Instead of forcing a manual diff across two files, the
+report lists **only the bones that differ** (matched by name), with both values,
+for: length, head/tail direction, roll, head/tail position, `use_deform`,
+`use_connect`, `use_inherit_rotation`, parent, child order, and bone-collection
+membership. It finishes with a **limb-tip "longest child" comparison** that flags
+any limb where the longest child of a tip parent (e.g. `Lower Arm`) changed
+between the two models — the exact failure mode that makes an auto-IK solver pick
+a twist/support bone as the hand. This is a fast "what did the transfer change?"
+report.
+
+#### Mesh skin / vertex-weight diagnostics
+
+Resonite builds its humanoid/IK rig from the **skinned mesh's bone bindings**, not
+the armature alone — so a bone that looks correct in the armature can still be
+mis-detected if the mesh carries no weight on it. For every mesh in the scene this
+reports: vertex count, vertex-group count, armature-modifier target, and the list
+of **empty vertex groups** (bones the mesh declares but doesn't actually skin to).
+It finishes with a **limb-tip weight focus**: for each limb-tip parent, the
+verts/weight carried by each child, flagging any `Hand`/`Foot` bone with
+**`[NO WEIGHT]`**. A limb-tip with no weight while its support sibling has weight
+is the prime reason an auto-IK solver binds to the support bone.
+
+#### Limb end-effector focus
+
+For each bone whose name contains `hand` / `foot` / `toe` / `head`, lists its
+parent and **all** of that parent's children ranked by length, with descendant
+count, deform flag, direction, and world-space tail. This is exactly the choice
+an auto-IK solver faces when picking a limb tip — if a *support* bone is longer
+or extends further than the real `Hand`/`Foot` bone, a length-based solver will
+mis-pick it, and that shows up here immediately. The dump explicitly flags when
+the longest child of a limb-tip parent is **not** a limb-tip-named bone.
+
 ---
 
 ## Compatibility
 
 | Blender version | Status |
 |-----------------|--------|
-| 3.0 – 4.x | Fully supported |
+| 3.0 – 3.1 | Not supported — requires `Context.temp_override` (added in 3.2) |
+| 3.2 – 4.x | Fully supported |
 | 5.0+ | Supported — bone selection API change (`Bone.select` → `PoseBone.select`) handled automatically |
 
 ---

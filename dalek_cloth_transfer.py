@@ -1,8 +1,10 @@
 bl_info = {
     "name": "Dalek Cloth Transfer",
     "author": "Dalek",
-    "version": (1, 0, 0),
-    "blender": (3, 0, 0),
+    "version": (1, 0, 5),
+    # Requires 3.2+: the addon depends on Context.temp_override, which was
+    # added in Blender 3.2. On 3.0/3.1 every operator here raises AttributeError.
+    "blender": (3, 2, 0),
     "location": "View3D > Sidebar > Cloth Transfer",
     "description": "Transfer Booth-style clothing armatures and meshes onto a base avatar armature",
     "category": "Rigging",
@@ -12,6 +14,7 @@ __version__ = bl_info["version"]
 __version_str__ = ".".join(str(x) for x in __version__)
 
 import difflib
+import math
 import os
 import re
 import tempfile
@@ -635,6 +638,57 @@ def _bake_pose_to_mesh_lbs(mesh, cloth):
     return True
 
 
+# Armature-modifier settings worth carrying across the remove/re-add that the
+# LBS bake performs. Stack *order* matters too (a Subdivision/Solidify after the
+# armature must stay after it), so the snapshot also records the index.
+_ARM_MOD_PROPS = (
+    "show_viewport", "show_render", "show_in_editmode", "show_on_cage",
+    "use_vertex_groups", "use_bone_envelopes", "use_deform_preserve_volume",
+    "use_multi_modifier", "vertex_group", "invert_vertex_group",
+)
+
+
+def _snapshot_arm_modifier(mesh, arm_obj):
+    """Capture name, stack index and settings of the ARMATURE modifier on `mesh`
+    that targets `arm_obj`, so an equivalent one can be restored in the same
+    place after the LBS bake removes it. Returns None if not found."""
+    for i, m in enumerate(mesh.modifiers):
+        if m.type == 'ARMATURE' and m.object == arm_obj:
+            snap = {"name": m.name, "index": i}
+            for prop in _ARM_MOD_PROPS:
+                if hasattr(m, prop):
+                    snap[prop] = getattr(m, prop)
+            return snap
+    return None
+
+
+def _restore_arm_modifier(context, mesh, arm_obj, snap):
+    """Re-create the armature modifier captured by `_snapshot_arm_modifier`,
+    restoring its settings and original stack position. Falls back gracefully
+    (modifier left at the end of the stack) if anything goes wrong."""
+    name = snap.get("name", "Armature") if snap else "Armature"
+    mod = mesh.modifiers.new(name=name, type='ARMATURE')
+    mod.object = arm_obj
+    if not snap:
+        return mod
+    for prop in _ARM_MOD_PROPS:
+        if prop in snap and hasattr(mod, prop):
+            try:
+                setattr(mod, prop, snap[prop])
+            except Exception:
+                pass
+    # new() appends to the end; move it back to where it was if other modifiers
+    # were sitting after it (e.g. Subdivision), or their evaluation order flips.
+    target = snap.get("index")
+    if target is not None and target < len(mesh.modifiers) - 1:
+        try:
+            with context.temp_override(active_object=mesh, object=mesh):
+                bpy.ops.object.modifier_move_to_index(modifier=mod.name, index=target)
+        except Exception:
+            pass
+    return mod
+
+
 def _match_pose(context, base, cloth, shared):
     """Match cloth's rest pose to base's rest pose for shared bones, mesh data included.
 
@@ -730,6 +784,10 @@ def _match_pose(context, base, cloth, shared):
             continue
         cloth_meshes.append(o)
 
+    # Snapshot each mesh's armature modifier (settings + stack index) BEFORE the
+    # bake removes it, so restoration preserves order and configuration.
+    mod_snapshots = {o: _snapshot_arm_modifier(o, cloth) for o in cloth_meshes}
+
     baked = []
     failed = []
     for mesh in cloth_meshes:
@@ -749,8 +807,7 @@ def _match_pose(context, base, cloth, shared):
     _set_mode_on(context, cloth, 'OBJECT')
 
     for mesh in baked:
-        new_mod = mesh.modifiers.new(name="Armature", type='ARMATURE')
-        new_mod.object = cloth
+        _restore_arm_modifier(context, mesh, cloth, mod_snapshots.get(mesh))
 
     print(
         f"[ClothTransfer v{__version_str__}] Match Pose: "
@@ -992,6 +1049,335 @@ class CLOTH_TRANSFER_OT_transfer(Operator):
         return {'FINISHED'}
 
 
+# Names that an auto-IK / humanoid solver tries to resolve to a single limb-tip
+# bone. When a limb-tip parent has several children, the solver disambiguates by
+# geometry — so these are the chains we surface in full in the debug dump.
+_LIMB_END_KEYWORDS = ("hand", "foot", "toe", "head")
+
+
+def _fmt_v(v, p=4):
+    return f"({v.x:+.{p}f}, {v.y:+.{p}f}, {v.z:+.{p}f})"
+
+
+def _bone_local_axes(bone):
+    """Bone's local X/Y/Z axes expressed in armature (rest) space. The Y axis is
+    the head→tail direction; X/Z together encode the bone roll. Comparing these
+    between two models reveals orientation/roll differences that a name+position
+    diff would miss."""
+    m = bone.matrix_local.to_3x3()
+    return m.col[0], m.col[1], m.col[2]
+
+
+def _bone_collections_str(bone):
+    """Membership in bone collections (Blender 4.0+) or armature layers (3.x),
+    whichever this build exposes."""
+    cols = getattr(bone, "collections", None)
+    if cols is not None:
+        names = [c.name for c in cols]
+        return ",".join(names) if names else "(none)"
+    layers = getattr(bone, "layers", None)
+    if layers is not None:
+        idxs = [str(i) for i, on in enumerate(layers) if on]
+        return "layers:" + (",".join(idxs) if idxs else "(none)")
+    return ""
+
+
+def _dump_armature_detail(L, label, obj):
+    """Full per-bone, read-only dump of one armature in rest/armature space.
+    Everything an auto-IK solver could key on: order, parent, deform/connect
+    flags, length, head/tail (local + world), local axes (roll), child order."""
+    L.append("")
+    L.append(f"=== FULL BONE DETAIL: {label} ({obj.name if obj else '-'}) ===")
+    if obj is None:
+        L.append("  (not set)")
+        return
+    if obj.type != 'ARMATURE':
+        L.append(f"  {obj.name}: not an armature — skipped")
+        return
+
+    mw = obj.matrix_world
+    loc, rot, scale = mw.decompose()
+    L.append(f"  matrix_world  loc={_fmt_v(loc)}  scale={_fmt_v(scale)}")
+    L.append(f"  matrix_world  rot(quat WXYZ)=({rot.w:+.4f}, {rot.x:+.4f}, {rot.y:+.4f}, {rot.z:+.4f})")
+    non_uniform = abs(scale.x - scale.y) > 1e-5 or abs(scale.x - scale.z) > 1e-5
+    if abs(scale.x - 1.0) > 1e-5 or non_uniform:
+        L.append(f"  NOTE: object scale is not identity (non-uniform={non_uniform}). "
+                 f"Resonite bakes world transforms — this affects every bone.")
+    L.append(f"  data.pose_position: {obj.data.pose_position}")
+
+    bones = list(obj.data.bones)
+    idx_of = {b.name: i for i, b in enumerate(bones)}
+    L.append(f"  Bone count: {len(bones)}  (table is in data.bones / export order)")
+    L.append("")
+    for i, b in enumerate(bones):
+        x, y, z = _bone_local_axes(b)
+        pname = b.parent.name if b.parent else "-"
+        pidx = idx_of.get(b.parent.name, "-") if b.parent else "-"
+        L.append(f"  [{i:3d}] {b.name}")
+        L.append(f"        parent={pname}[{pidx}]  deform={int(b.use_deform)}  "
+                 f"connect={int(b.use_connect)}  inherit_rot={int(b.use_inherit_rotation)}  "
+                 f"childN={len(b.children)}  descN={len(b.children_recursive)}")
+        L.append(f"        head_local={_fmt_v(b.head_local)}  tail_local={_fmt_v(b.tail_local)}  "
+                 f"len={b.length:.5f}")
+        L.append(f"        world_head={_fmt_v(mw @ b.head_local)}  world_tail={_fmt_v(mw @ b.tail_local)}")
+        L.append(f"        axisX={_fmt_v(x)}  axisY(dir)={_fmt_v(y)}  axisZ={_fmt_v(z)}")
+        cols = _bone_collections_str(b)
+        if cols:
+            L.append(f"        collections={cols}")
+
+    L.append("")
+    L.append("  -- child order (parent -> [children, in data order]) --")
+    any_multi = False
+    for b in bones:
+        if b.children:
+            kids = [c.name for c in b.children]
+            flag = "  <-- multiple children" if len(kids) > 1 else ""
+            L.append(f"    {b.name} -> {kids}{flag}")
+            if len(kids) > 1:
+                any_multi = True
+    if not any_multi:
+        L.append("    (no bone has more than one child)")
+
+
+def _dump_limb_focus(L, label, obj):
+    """For each detected limb-tip bone (hand/foot/toe/head), print its parent and
+    ALL of that parent's children with the geometry an auto-IK solver compares
+    when choosing the tip: length, descendant count, direction, world tail.
+    Side-by-side with the same dump from a working model, the bone the solver
+    would pick (longest / furthest-extending child) becomes obvious."""
+    if obj is None or obj.type != 'ARMATURE':
+        return
+    mw = obj.matrix_world
+    targets = [b for b in obj.data.bones
+               if any(k in b.name.lower() for k in _LIMB_END_KEYWORDS)]
+    if not targets:
+        return
+    L.append("")
+    L.append(f"=== LIMB END-EFFECTOR FOCUS: {label} ({obj.name}) ===")
+    L.append("  For each limb-tip parent, the children an auto-IK solver picks between.")
+    L.append("  A solver that ignores names tends to pick the longest / furthest-")
+    L.append("  extending child as the tip — compare these rows against the working model.")
+    seen_parents = set()
+    for t in targets:
+        parent = t.parent
+        if parent is None or parent.name in seen_parents:
+            continue
+        seen_parents.add(parent.name)
+        L.append("")
+        L.append(f"  Parent: {parent.name}  len={parent.length:.5f}  dir={_fmt_v(_bone_local_axes(parent)[1], 3)}")
+        ranked = sorted(parent.children, key=lambda c: c.length, reverse=True)
+        for c in ranked:
+            d = (c.tail_local - c.head_local)
+            dn = d.normalized() if d.length > 1e-9 else d
+            is_end = any(k in c.name.lower() for k in _LIMB_END_KEYWORDS)
+            mark = "  <-- limb-tip name" if is_end else ""
+            L.append(f"    {c.name:<30} len={c.length:.5f}  descN={len(c.children_recursive)}  "
+                     f"deform={int(c.use_deform)}  dir={_fmt_v(dn, 3)}  "
+                     f"world_tail={_fmt_v(mw @ c.tail_local, 3)}{mark}")
+        longest = ranked[0] if ranked else None
+        if longest is not None and not any(k in longest.name.lower() for k in _LIMB_END_KEYWORDS):
+            L.append(f"    !! longest child is '{longest.name}', NOT a limb-tip-named bone — "
+                     f"a length-based solver would pick it as the tip.")
+
+
+def _angle_deg(a, b):
+    """Angle in degrees between two vectors. 0 if either is degenerate."""
+    la, lb = a.length, b.length
+    if la < 1e-9 or lb < 1e-9:
+        return 0.0
+    c = max(-1.0, min(1.0, a.dot(b) / (la * lb)))
+    return math.degrees(math.acos(c))
+
+
+def _dump_ab_diff(L, base, cloth):
+    """Bone-by-bone A/B diff between two armatures matched by name. A = base
+    (reference / known-good), B = cloth (comparison / suspect). Prints ONLY the
+    bones whose IK-relevant attributes differ, with both values, plus a roll-up
+    of any limb-tip parents whose 'longest child' identity flips between the two.
+
+    Intended workflow: load the working model as Base and the broken model as
+    Clothing in one scene, then dump — the result is a direct 'what changed' report
+    instead of a manual diff across two files."""
+    if (base is None or cloth is None or base.type != 'ARMATURE'
+            or cloth.type != 'ARMATURE' or base == cloth):
+        return
+    L.append("")
+    L.append("=== A/B BONE DIFF (A=BASE reference vs B=CLOTH comparison) ===")
+    L.append(f"  A = {base.name}   B = {cloth.name}")
+    L.append("  Only bones that differ are listed. Tolerances: len 5e-4, "
+             "angle 1.0°, pos 5e-4.")
+
+    a_bones = {b.name: b for b in base.data.bones}
+    b_bones = {b.name: b for b in cloth.data.bones}
+    a_names, b_names = set(a_bones), set(b_bones)
+    shared = sorted(a_names & b_names)
+
+    LEN_TOL, ANG_TOL, POS_TOL = 5e-4, 1.0, 5e-4
+    diff_count = 0
+    for name in shared:
+        a, b = a_bones[name], b_bones[name]
+        ax, ay, az = _bone_local_axes(a)
+        bx, by, bz = _bone_local_axes(b)
+        msgs = []
+        if abs(a.length - b.length) > LEN_TOL:
+            msgs.append(f"len {a.length:.5f} -> {b.length:.5f} "
+                        f"({(b.length - a.length):+.5f})")
+        dir_ang = _angle_deg(ay, by)
+        if dir_ang > ANG_TOL:
+            msgs.append(f"direction {dir_ang:.2f}° off")
+        roll_ang = _angle_deg(ax, bx)
+        if roll_ang > ANG_TOL:
+            msgs.append(f"roll {roll_ang:.2f}° off")
+        if (a.head_local - b.head_local).length > POS_TOL:
+            msgs.append(f"head {_fmt_v(a.head_local, 4)} -> {_fmt_v(b.head_local, 4)}")
+        if (a.tail_local - b.tail_local).length > POS_TOL:
+            msgs.append(f"tail {_fmt_v(a.tail_local, 4)} -> {_fmt_v(b.tail_local, 4)}")
+        if a.use_deform != b.use_deform:
+            msgs.append(f"deform {int(a.use_deform)} -> {int(b.use_deform)}")
+        if a.use_connect != b.use_connect:
+            msgs.append(f"connect {int(a.use_connect)} -> {int(b.use_connect)}")
+        if a.use_inherit_rotation != b.use_inherit_rotation:
+            msgs.append(f"inherit_rot {int(a.use_inherit_rotation)} -> {int(b.use_inherit_rotation)}")
+        ap = a.parent.name if a.parent else "-"
+        bp = b.parent.name if b.parent else "-"
+        if ap != bp:
+            msgs.append(f"parent {ap} -> {bp}")
+        a_kids = [c.name for c in a.children]
+        b_kids = [c.name for c in b.children]
+        if a_kids != b_kids:
+            msgs.append(f"child order {a_kids} -> {b_kids}")
+        a_col = _bone_collections_str(a)
+        b_col = _bone_collections_str(b)
+        if a_col != b_col:
+            msgs.append(f"collections {a_col} -> {b_col}")
+        if msgs:
+            diff_count += 1
+            L.append(f"  ~ {name}")
+            for m in msgs:
+                L.append(f"        {m}")
+
+    only_a = sorted(a_names - b_names)
+    only_b = sorted(b_names - a_names)
+    L.append("")
+    L.append(f"  Differing shared bones: {diff_count} / {len(shared)}")
+    L.append(f"  Only in A (base): {len(only_a)} {only_a[:40]}")
+    L.append(f"  Only in B (cloth): {len(only_b)} {only_b[:40]}")
+
+    # Did the 'longest child' of any limb-tip parent flip between A and B? That is
+    # the exact failure mode for a length-based auto-IK solver.
+    L.append("")
+    L.append("  -- limb-tip 'longest child' comparison --")
+    flips = 0
+    a_parents = {bn.parent.name for bn in base.data.bones
+                 if bn.parent and any(k in bn.name.lower() for k in _LIMB_END_KEYWORDS)}
+    for pname in sorted(a_parents):
+        pa, pb = a_bones.get(pname), b_bones.get(pname)
+        if pa is None or pb is None or not pa.children or not pb.children:
+            continue
+        la = max(pa.children, key=lambda c: c.length)
+        lb = max(pb.children, key=lambda c: c.length)
+        a_is_tip = any(k in la.name.lower() for k in _LIMB_END_KEYWORDS)
+        b_is_tip = any(k in lb.name.lower() for k in _LIMB_END_KEYWORDS)
+        flag = ""
+        if la.name != lb.name or a_is_tip != b_is_tip:
+            flag = "  <-- FLIP"
+            flips += 1
+        L.append(f"    under {pname}: A longest={la.name}({la.length:.4f}) "
+                 f"B longest={lb.name}({lb.length:.4f}){flag}")
+    if flips:
+        L.append(f"  !! {flips} limb-tip parent(s) changed which child is longest — "
+                 f"prime suspect for the auto-IK mis-pick.")
+
+
+def _mesh_arm_targets(mesh):
+    return [m.object for m in mesh.modifiers if m.type == 'ARMATURE' and m.object]
+
+
+def _weight_stats(mesh):
+    """Single pass over a mesh's vertices: per vertex-group, how many vertices
+    carry a non-trivial weight and the total weight. Lets us spot vertex groups
+    that exist but are effectively empty (a bone the mesh declares but doesn't
+    actually skin to)."""
+    name_by_idx = {vg.index: vg.name for vg in mesh.vertex_groups}
+    counts, sums = {}, {}
+    for v in mesh.data.vertices:
+        for ge in v.groups:
+            if ge.weight > 1e-4:
+                counts[ge.group] = counts.get(ge.group, 0) + 1
+                sums[ge.group] = sums.get(ge.group, 0.0) + ge.weight
+    return name_by_idx, counts, sums
+
+
+def _dump_mesh_weights(L, context, armature):
+    """Per-mesh skin diagnostics + a limb-tip weight focus. Resonite builds its
+    humanoid/IK rig from the skinned mesh's bone bindings, so a bone that looks
+    correct in the armature but carries NO mesh weight (or whose wrist verts were
+    moved onto a sibling support bone) will be mis-detected. This surfaces that."""
+    meshes = [o for o in context.scene.objects if o.type == 'MESH']
+    L.append("")
+    L.append("=== MESH SKIN / VERTEX-WEIGHT DIAGNOSTICS ===")
+    if not meshes:
+        L.append("  (no mesh objects in scene)")
+        return
+
+    global_bone = {}  # bone name -> [vert_count, weight_sum]
+    for mesh in meshes:
+        name_by_idx, counts, sums = _weight_stats(mesh)
+        arm = _mesh_arm_targets(mesh)
+        empty = [name_by_idx[vg.index] for vg in mesh.vertex_groups
+                 if counts.get(vg.index, 0) == 0]
+        L.append("")
+        L.append(f"  Mesh: {mesh.name}  verts={len(mesh.data.vertices)}  "
+                 f"vgroups={len(mesh.vertex_groups)}  "
+                 f"armature_mod={[a.name for a in arm]}")
+        L.append(f"    empty vgroups ({len(empty)}): {sorted(empty)[:40]}")
+        for gi, cnt in counts.items():
+            nm = name_by_idx.get(gi)
+            if nm is None:
+                continue
+            gb = global_bone.setdefault(nm, [0, 0.0])
+            gb[0] += cnt
+            gb[1] += sums.get(gi, 0.0)
+
+    if armature is None or armature.type != 'ARMATURE':
+        return
+    L.append("")
+    L.append("  -- limb-tip weight focus (verts / weight per child, across all meshes) --")
+    L.append("  A limb-tip bone (Hand/Foot) with NO WEIGHT while its support sibling")
+    L.append("  has weight is the prime cause of an auto-IK solver picking the support.")
+    seen = set()
+    for b in armature.data.bones:
+        if not any(k in b.name.lower() for k in _LIMB_END_KEYWORDS):
+            continue
+        p = b.parent
+        if p is None or p.name in seen:
+            continue
+        seen.add(p.name)
+        L.append(f"    under {p.name}:")
+        for c in p.children:
+            gb = global_bone.get(c.name, [0, 0.0])
+            tip = "  <-- limb-tip name" if any(k in c.name.lower() for k in _LIMB_END_KEYWORDS) else ""
+            flag = "  [NO WEIGHT]" if gb[0] == 0 else ""
+            L.append(f"      {c.name:<30} verts={gb[0]:6d}  weight_sum={gb[1]:9.2f}{tip}{flag}")
+
+
+def _detail_targets(context, p):
+    """Armatures to run the full-detail / limb-focus dump on. Prefers the two
+    configured armatures; if neither is set (e.g. you're inspecting a finished,
+    single-armature model where the cloth rig was already deleted), falls back to
+    the active object, then to every armature in the scene."""
+    out = []
+    for obj in (p.base_armature, p.cloth_armature):
+        if obj is not None and obj.type == 'ARMATURE' and obj not in out:
+            out.append(obj)
+    if out:
+        return out
+    active = context.active_object
+    if active is not None and active.type == 'ARMATURE':
+        return [active]
+    return [o for o in context.scene.objects if o.type == 'ARMATURE']
+
+
 class CLOTH_TRANSFER_OT_dump_debug(Operator):
     bl_idname = "cloth_transfer.dump_debug"
     bl_label = "Dump Debug Info"
@@ -1011,6 +1397,10 @@ class CLOTH_TRANSFER_OT_dump_debug(Operator):
         L.append("=== Dalek Cloth Transfer — Debug Dump ===")
         L.append(f"Plugin version: {__version_str__}")
         L.append(f"Blender: {bpy.app.version_string}")
+        blend_path = bpy.data.filepath
+        L.append(f"Blend file: {os.path.basename(blend_path) if blend_path else '(unsaved)'}")
+        if blend_path:
+            L.append(f"Blend path: {blend_path}")
         L.append(f"Transfer new bones: {p.transfer_new_bones}")
         L.append(f"Delete extra bones: {p.delete_extra_bones}")
         L.append(f"Skip body-part bones: {p.skip_body_part_bones}")
@@ -1107,6 +1497,40 @@ class CLOTH_TRANSFER_OT_dump_debug(Operator):
                     L.append(f"  P75:    {ratios[(len(ratios)*3)//4]:.4f}")
                     L.append(f"  Max:    {ratios[-1]:.4f}")
                     L.append(f"  Mean:   {sum(ratios) / len(ratios):.4f}")
+
+        # Full per-bone detail + limb end-effector focus. Runs on the configured
+        # armatures, or falls back to the active / all scene armatures so it works
+        # on a finished single-armature model (cloth rig already deleted) too.
+        targets = _detail_targets(context, p)
+        if not targets:
+            L.append("")
+            L.append("=== FULL BONE DETAIL ===")
+            L.append("  (no armature found — set Base/Clothing, select an armature, "
+                     "or add one to the scene)")
+        else:
+            configured = {o for o in (base, cloth) if o is not None}
+            for obj in targets:
+                if obj is base:
+                    label = "BASE"
+                elif obj is cloth:
+                    label = "CLOTH"
+                elif obj in configured:
+                    label = "CONFIGURED"
+                else:
+                    label = "SCENE ARMATURE"
+                _dump_armature_detail(L, label, obj)
+            for obj in targets:
+                label = ("BASE" if obj is base else "CLOTH" if obj is cloth
+                         else "ARMATURE")
+                _dump_limb_focus(L, label, obj)
+
+        # Direct A/B diff when both armatures are set — load the good model as
+        # Base and the broken one as Clothing to get a 'what changed' report.
+        _dump_ab_diff(L, base, cloth)
+
+        # Mesh skin / weight diagnostics — the armature can look correct while the
+        # skinned mesh (what Resonite actually reads) has lost weight on a limb tip.
+        _dump_mesh_weights(L, context, targets[0] if targets else None)
 
         text = "\n".join(L)
 
